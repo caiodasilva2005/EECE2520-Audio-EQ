@@ -1,0 +1,17 @@
+[Unit]
+Description=Audio-EQ DAC writer daemon (MCP4822)
+After=local-fs.target
+
+[Service]
+Type=simple
+User=audio-eq
+Group=audio-eq
+WorkingDirectory=/opt/audio-eq
+ExecStart=/opt/audio-eq/.venv/bin/python /opt/audio-eq/source/dac-writer/main.py
+RuntimeDirectory=audio-eq
+RuntimeDirectoryMode=0750
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

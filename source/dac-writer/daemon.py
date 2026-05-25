@@ -4,7 +4,7 @@ import struct
 
 import numpy as np
 
-DEFAULT_SOCKET_PATH = '/tmp/audio.sock'
+DEFAULT_SOCKET_PATH = '/run/audio-eq/audio.sock'
 HEADER_FMT = '>cI'                       # 1-byte tag, 4-byte big-endian length
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 HANDSHAKE_FMT = '>I'                     # 4-byte big-endian uint32 sample rate (Hz)

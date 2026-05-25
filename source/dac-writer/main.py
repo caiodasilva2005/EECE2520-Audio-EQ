@@ -5,10 +5,10 @@ import time
 
 TWELVE_BIT_MAX_RESOLUTION = 0x0FFF
 
-DAC1 = "/sys/bus/iio/devices/iio:device0/out_voltage0_raw"
-DAC2 = "/sys/bus/iio/devices/iio:device0/out_voltage1_raw"
+DAC1 = "/sys/bus/iio/devices/iio:device0/out_voltage0_raw" # DAC Channel A
+DAC2 = "/sys/bus/iio/devices/iio:device0/out_voltage1_raw" # DAC Channel B
 
-# Class for managing Writer to an Adafruit AD569R DAC
+# Class for managing Writer to an Microchip MCP4822 DAC
 class DAC:
     def __init__(self, dac):
         try:

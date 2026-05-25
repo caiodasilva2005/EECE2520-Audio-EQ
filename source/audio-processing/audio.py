@@ -1,7 +1,7 @@
 
 from time import time
 import numpy as np
-from Soundfile import SoundFile
+from soundfile import SoundFile
 from scipy import signal as sig
 
 # An Audio Processor divide an audio file into two frequency channels
@@ -19,11 +19,11 @@ class AudioProcessor:
     # param blockSize: the size of each audio block to be processed (default
     #                    1024 samples)
     # throws IOError if there is an error reading the audio file
-    def __init__(self, filepath, callback=None, cutoffFreq=1000, filterOrder=10, blockSize=1024):
+    def __init__(self, filepath, cutoffFreq=1000, filterOrder=10, blockSize=1024):
         self._filepath = filepath
         self._cutoffFreq = cutoffFreq
         self._filterOrder = filterOrder
-        self._callback = callback
+        self._callback = None
         self._blockSize = blockSize
 
         self._highFrequencyChannel = np.zeros(blockSize)
@@ -56,6 +56,13 @@ class AudioProcessor:
     def setCutoffFrequency(self, cutoffFreq):
         self._cutoffFreq = cutoffFreq
         self._sos = self._buildSos()
+
+    def setCallback(self, callback):
+        self._callback = callback
+
+    # gets the sampling frequency of the audio file
+    def getSamplingFrequency(self):
+        return self._soundFile.samplerate
 
     # Processes audio file in blocks until all blocks are processed
     # Performs a given callback function on each channel after processing each block
