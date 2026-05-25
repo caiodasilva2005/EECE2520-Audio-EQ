@@ -1,6 +1,5 @@
 
 from time import time
-import matplotlib.pyplot as plt
 import numpy as np
 from Soundfile import SoundFile
 from scipy import signal as sig
