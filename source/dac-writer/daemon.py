@@ -1,6 +1,8 @@
 import os
+import queue
 import socket
 import struct
+import threading
 
 import numpy as np
 
@@ -37,6 +39,18 @@ def DACWriterDaemon(lowChannelCallback, highChannelCallback, onConnect=None,
         samples = np.frombuffer(_recvExact(conn, length), dtype=SAMPLE_DTYPE)
         return tag, samples
 
+    # Drains a per-channel queue until a sentinel (None) is received,
+    # invoking the given callback for each sample buffer.
+    def _writerLoop(q, callback, name):
+        while True:
+            samples = q.get()
+            if samples is None:
+                return
+            try:
+                callback(samples)
+            except Exception as e:
+                print(f"[{name}] callback error: {e}")
+
     def _handleConnection(conn):
         try:
             # Receive sampling frequency from handshake
@@ -47,20 +61,44 @@ def DACWriterDaemon(lowChannelCallback, highChannelCallback, onConnect=None,
         if onConnect is not None:
             # Callback upon receiving sample frequency
             onConnect(sampleRate)
-        while True:
-            try:
-                # Daemon expects samples as tag ('L' or 'H') and array of bytes for the audio sample
-                tag, samples = _readFrame(conn)
-            except ConnectionError:
-                return
-            if tag == b'L':
-                # Callback to process low frequency channel
-                lowChannelCallback(samples)
-            elif tag == b'H':
-                # Callback to process high frequency channel
-                highChannelCallback(samples)
-            else:
-                print(f"unknown tag: {tag!r}")
+
+        # Bounded queues keep backpressure tight: if a writer stalls, the
+        # reader blocks on put, which blocks the socket read, which surfaces
+        # the stall to the audio producer instead of hiding it in a deep
+        # kernel/userspace buffer.
+        lowQueue = queue.Queue(maxsize=4)
+        highQueue = queue.Queue(maxsize=4)
+
+        lowWriter = threading.Thread(
+            target=_writerLoop, args=(lowQueue, lowChannelCallback, "L"),
+            name="dac-writer-L", daemon=True,
+        )
+        highWriter = threading.Thread(
+            target=_writerLoop, args=(highQueue, highChannelCallback, "H"),
+            name="dac-writer-H", daemon=True,
+        )
+        lowWriter.start()
+        highWriter.start()
+
+        try:
+            while True:
+                try:
+                    # Daemon expects samples as tag ('L' or 'H') and array of bytes for the audio sample
+                    tag, samples = _readFrame(conn)
+                except ConnectionError:
+                    return
+                if tag == b'L':
+                    lowQueue.put(samples)
+                elif tag == b'H':
+                    highQueue.put(samples)
+                else:
+                    print(f"unknown tag: {tag!r}")
+        finally:
+            # Drain remaining work and shut writers down cleanly.
+            lowQueue.put(None)
+            highQueue.put(None)
+            lowWriter.join()
+            highWriter.join()
 
     # Runs the main daemon process
     def startDaemon():
