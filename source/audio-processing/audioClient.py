@@ -10,6 +10,7 @@ HANDSHAKE_FMT = '>I'                     # 4-byte big-endian uint32 sample rate 
 class AudioClient():
     def __init__(self, audioProcesser):
         self._audioProcesser = audioProcesser
+        self._connected = False
 
     def connectToDacWriterDaemon(self, socketPath=DEFAULT_SOCKET_PATH):
         self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -21,6 +22,8 @@ class AudioClient():
         self._audioProcesser.setCallback(self._sendAudioBlockToDaemon)
         # Process audio file and send to DAC writer daemon
 
+        self._connected = True
+
     def _sendAudioBlockToDaemon(self, highFrequencyChannel, lowFrequencyChannel):
         # Send low frequency channel with tag 'L'
         self._socket.sendall(struct.pack(HEADER_FMT, b'L', lowFrequencyChannel.nbytes))
@@ -30,4 +33,7 @@ class AudioClient():
         self._socket.sendall(highFrequencyChannel.tobytes())
 
     def processAudio(self, done_callback=None):
-        self._audioProcesser.processAudio(done_callback)
+        if self._connected:
+            self._audioProcesser.processAudio(done_callback)
+        else:
+            raise Exception("Cannot process audio. Client has not connected to the Daemon.")

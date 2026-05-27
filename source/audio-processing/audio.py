@@ -1,5 +1,6 @@
 
-from time import time
+import time
+import threading
 import numpy as np
 from soundfile import SoundFile
 from scipy import signal as sig
@@ -37,6 +38,10 @@ class AudioProcessor:
         self._sos = self._buildSos()
         self._zi = np.zeros((self._sos.shape[0], 2))
 
+        # Event is set when running, cleared when paused.
+        self._pauseEvent = threading.Event()
+        self._pauseEvent.set()
+
     # builds the second-order sections for the Butterworth high-pass filter based on the cutoff frequency and filter order
     def _buildSos(self):
         return sig.butter(self._filterOrder, self._cutoffFreq, 'hp',
@@ -60,6 +65,17 @@ class AudioProcessor:
     def setCallback(self, callback):
         self._callback = callback
 
+    # pauses processAudio; safe to call from another thread
+    def pause(self):
+        self._pauseEvent.clear()
+
+    # resumes processAudio after a pause; safe to call from another thread
+    def resume(self):
+        self._pauseEvent.set()
+
+    def isPaused(self):
+        return not self._pauseEvent.is_set()
+
     # gets the sampling frequency of the audio file
     def getSamplingFrequency(self):
         return self._soundFile.samplerate
@@ -73,6 +89,13 @@ class AudioProcessor:
         block_duration = self._blockSize / self._soundFile.samplerate
         start = time.monotonic()
         for i, block in enumerate(self._soundFile.blocks(blocksize=self._blockSize)):
+          # If paused, block here until resumed and shift the timing baseline
+          # forward so the deadline loop doesn't race to "catch up" on resume.
+          if self.isPaused():
+              pause_started = time.monotonic()
+              self._pauseEvent.wait()
+              start += time.monotonic() - pause_started
+
           self._filterAudioBlock(block)
 
           if self._callback is not None:
