@@ -36,7 +36,7 @@ class AudioProcessor:
             raise IOError(f"Error reading audio file: {e}")
 
         self._sos = self._buildSos()
-        self._zi = np.zeros((self._sos.shape[0], 2))
+        self._zi = np.zeros((self._sos.shape[0], 2, self._soundFile.channels))
 
         # Event is set when running, cleared when paused.
         self._pauseEvent = threading.Event()
@@ -49,18 +49,20 @@ class AudioProcessor:
 
     # filters the given audio block using the high-pass filter and separates it into high-frequency and low-frequency channels
     def _filterAudioBlock(self, audioBlock):
-        self._highFrequencyChannel, self._zi = sig.sosfilt(self._sos, audioBlock, zi=self._zi)
+        self._highFrequencyChannel, self._zi = sig.sosfilt(self._sos, audioBlock, axis=0, zi=self._zi)
         self._LowFrequencyChannel = audioBlock - self._highFrequencyChannel
 
     # sets the filter order and rebuilds the second-order sections for the Butterworth high-pass filter
     def setFilterOrder(self, filterOrder):
         self._filterOrder = filterOrder
         self._sos = self._buildSos()
-    
+        self._zi = np.zeros((self._sos.shape[0], 2, self._soundFile.channels))
+
     # sets the cutoff frequency and rebuilds the second-order sections for the Butterworth high-pass filter
     def setCutoffFrequency(self, cutoffFreq):
         self._cutoffFreq = cutoffFreq
         self._sos = self._buildSos()
+        self._zi = np.zeros((self._sos.shape[0], 2, self._soundFile.channels))
 
     def setCallback(self, callback):
         self._callback = callback
@@ -88,7 +90,7 @@ class AudioProcessor:
     def processAudio(self, done_callback=None):
         block_duration = self._blockSize / self._soundFile.samplerate
         start = time.monotonic()
-        for i, block in enumerate(self._soundFile.blocks(blocksize=self._blockSize)):
+        for i, block in enumerate(self._soundFile.blocks(blocksize=self._blockSize, always_2d=True)):
           # If paused, block here until resumed and shift the timing baseline
           # forward so the deadline loop doesn't race to "catch up" on resume.
           if self.isPaused():
