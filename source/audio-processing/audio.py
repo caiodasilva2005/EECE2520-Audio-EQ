@@ -49,8 +49,10 @@ class AudioProcessor:
 
     # filters the given audio block using the high-pass filter and separates it into high-frequency and low-frequency channels
     def _filterAudioBlock(self, audioBlock):
+        t0 = time.monotonic()
         self._highFrequencyChannel, self._zi = sig.sosfilt(self._sos, audioBlock, axis=0, zi=self._zi)
         self._LowFrequencyChannel = audioBlock - self._highFrequencyChannel
+        self._lastFilterMs = (time.monotonic() - t0) * 1000.0
 
     # sets the filter order and rebuilds the second-order sections for the Butterworth high-pass filter
     def setFilterOrder(self, filterOrder):
@@ -89,24 +91,69 @@ class AudioProcessor:
     # NOTE: will block for the length of the given audio file
     def processAudio(self, done_callback=None):
         block_duration = self._blockSize / self._soundFile.samplerate
+        print(f"[audio] start: sr={self._soundFile.samplerate} Hz "
+              f"channels={self._soundFile.channels} blockSize={self._blockSize} "
+              f"block_duration={block_duration*1000:.2f}ms "
+              f"cutoff={self._cutoffFreq}Hz order={self._filterOrder} sections={self._sos.shape[0]}")
+        behind_count = 0
         start = time.monotonic()
         for i, block in enumerate(self._soundFile.blocks(blocksize=self._blockSize, always_2d=True)):
+          block_t0 = time.monotonic()
+
           # If paused, block here until resumed and shift the timing baseline
           # forward so the deadline loop doesn't race to "catch up" on resume.
           if self.isPaused():
               pause_started = time.monotonic()
+              print(f"[audio] block #{i}: paused")
               self._pauseEvent.wait()
-              start += time.monotonic() - pause_started
+              paused_for = time.monotonic() - pause_started
+              start += paused_for
+              print(f"[audio] block #{i}: resumed after {paused_for*1000:.1f}ms")
+
+          # Input block stats
+          in_min = float(np.min(block))
+          in_max = float(np.max(block))
+          in_mean = float(np.mean(block))
 
           self._filterAudioBlock(block)
 
+          hf_min = float(np.min(self._highFrequencyChannel))
+          hf_max = float(np.max(self._highFrequencyChannel))
+          lf_min = float(np.min(self._LowFrequencyChannel))
+          lf_max = float(np.max(self._LowFrequencyChannel))
+
+          cb_ms = 0.0
           if self._callback is not None:
+              cb_t0 = time.monotonic()
               self._callback(self._highFrequencyChannel, self._LowFrequencyChannel)
+              cb_ms = (time.monotonic() - cb_t0) * 1000.0
 
           deadline = start + (i + 1) * block_duration
-          delay = deadline - time.monotonic()
+          now = time.monotonic()
+          delay = deadline - now
+          work_ms = (now - block_t0) * 1000.0
+          elapsed_ms = (now - start) * 1000.0
+          drift_ms = (now - deadline) * 1000.0  # +ve means behind schedule
+
+          print(
+              f"[audio] block #{i}: shape={block.shape} dtype={block.dtype} "
+              f"in[min={in_min:+.4f} max={in_max:+.4f} mean={in_mean:+.4f}] "
+              f"hf[min={hf_min:+.4f} max={hf_max:+.4f}] lf[min={lf_min:+.4f} max={lf_max:+.4f}] "
+              f"filter={self._lastFilterMs:.2f}ms cb={cb_ms:.2f}ms work={work_ms:.2f}ms "
+              f"budget={block_duration*1000:.2f}ms "
+              f"deadline_drift={drift_ms:+.2f}ms elapsed={elapsed_ms:.1f}ms"
+          )
+
           if delay > 0:
+              print(f"[audio] block #{i}: sleeping {delay*1000:.2f}ms to meet deadline")
               time.sleep(delay)
-    
+          else:
+              behind_count += 1
+              print(f"[audio] block #{i}: BEHIND by {-delay*1000:.2f}ms (total behind: {behind_count})")
+
+        total_ms = (time.monotonic() - start) * 1000.0
+        print(f"[audio] done: {i+1} blocks, {total_ms:.1f}ms elapsed, "
+              f"{behind_count} blocks missed deadline")
+
         if done_callback is not None:
             done_callback()

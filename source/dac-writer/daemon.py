@@ -9,7 +9,7 @@ HEADER_FMT = '>cI'                       # 1-byte tag, 4-byte big-endian length
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 HANDSHAKE_FMT = '>I'                     # 4-byte big-endian uint32 sample rate (Hz)
 HANDSHAKE_SIZE = struct.calcsize(HANDSHAKE_FMT)
-SAMPLE_DTYPE = np.float32
+SAMPLE_DTYPE = np.float64
 
 # Daemon Function to process samples for the DAC Writer
 # param lowChannelCallback: Callback function to process low frequency samples
