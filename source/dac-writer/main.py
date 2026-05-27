@@ -30,32 +30,10 @@ class DAC:
 
         # incoming sample stats
         n = len(sample)
-        sample_min = float(np.min(sample)) if n else float('nan')
-        sample_max = float(np.max(sample)) if n else float('nan')
-        sample_mean = float(np.mean(sample)) if n else float('nan')
-        sample_rms = float(np.sqrt(np.mean(np.square(sample, dtype=np.float64)))) if n else float('nan')
-        head_preview = np.array2string(sample[:8], precision=4, separator=", ")
-        out_of_range = int(np.sum((sample < -1.0) | (sample > 1.0)))
-        print(
-            f"[{self._name}] block #{block_idx}: n={n} dtype={sample.dtype} "
-            f"min={sample_min:+.4f} max={sample_max:+.4f} mean={sample_mean:+.4f} rms={sample_rms:.4f} "
-            f"out_of_[-1,1]={out_of_range} head={head_preview}"
-        )
-
+        
         # shift and scale the incoming sample to a value within 16-bit resolution
         scaled = (sample + 1.0) * (TWELVE_BIT_MAX_RESOLUTION / 2)
-        clipped_count = int(np.sum((scaled < 0) | (scaled > TWELVE_BIT_MAX_RESOLUTION)))
         codes = np.clip(scaled, 0, TWELVE_BIT_MAX_RESOLUTION).astype(np.uint16)
-
-        # outgoing code stats
-        code_min = int(np.min(codes)) if n else -1
-        code_max = int(np.max(codes)) if n else -1
-        code_mean = float(np.mean(codes)) if n else float('nan')
-        code_head = np.array2string(codes[:8], separator=", ")
-        print(
-            f"[{self._name}] block #{block_idx} codes: min={code_min} max={code_max} mean={code_mean:.1f} "
-            f"clipped={clipped_count}/{n} head={code_head}"
-        )
 
         if self._samplingFrequnecy <= 0:
             print(f"[{self._name}] WARNING: sampling frequency not set; pacing disabled")
