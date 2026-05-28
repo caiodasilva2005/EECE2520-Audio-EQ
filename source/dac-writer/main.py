@@ -137,9 +137,11 @@ def main():
     dac = DAC(name="DAC-AB")
 
     def set_sampling_frequency(sample_rate_hz):
+        print("Set sampling frequency:", sample_rate_hz)
         configure_iio_buffer(sample_rate_hz)
 
     def write_samples(samples_ch0, samples_ch1):
+        print("WRITING SAMPLES")
         dac.writeSamplesToDAC(samples_ch0, samples_ch1)
 
     daemon_process = DACWriterDaemon(

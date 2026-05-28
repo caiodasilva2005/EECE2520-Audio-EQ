@@ -14,11 +14,10 @@ HANDSHAKE_SIZE = struct.calcsize(HANDSHAKE_FMT)
 SAMPLE_DTYPE = np.float64
 
 # Daemon Function to process samples for the DAC Writer
-# param lowChannelCallback: Callback function to process low frequency samples
-# param highChannelCallback: Callback function to process high frequency samples
+# param channelCallback: Callback function to process samples
 # param onConnect: Callback function called upon connecting to a client
 # param socketPath: Location of socket file in filesystem
-def DACWriterDaemon(lowChannelCallback, highChannelCallback, onConnect=None,
+def DACWriterDaemon(channelCallback, onConnect=None,
                     socketPath=DEFAULT_SOCKET_PATH):
 
     def _recvExact(conn, n):
@@ -66,20 +65,24 @@ def DACWriterDaemon(lowChannelCallback, highChannelCallback, onConnect=None,
         # reader blocks on put, which blocks the socket read, which surfaces
         # the stall to the audio producer instead of hiding it in a deep
         # kernel/userspace buffer.
-        lowQueue = queue.Queue(maxsize=4)
-        highQueue = queue.Queue(maxsize=4)
+        frameQueue = queue.Queue(maxsize=4)
 
-        lowWriter = threading.Thread(
-            target=_writerLoop, args=(lowQueue, lowChannelCallback, "L"),
-            name="dac-writer-L", daemon=True,
-        )
-        highWriter = threading.Thread(
-            target=_writerLoop, args=(highQueue, highChannelCallback, "H"),
-            name="dac-writer-H", daemon=True,
-        )
-        lowWriter.start()
-        highWriter.start()
+        def _writerLoop():
+            while True:
+                item = frameQueue.get()
+                if item is None:
+                    return
+                low_samples, high_samples = item
+                try:
+                    channelCallback(low_samples, high_samples)
+                except Exception as e:
+                    print(f"[DAC] callback error: {e}")
+        
+        writer = threading.Thread(
+        target=_writerLoop, name="dac-writer", daemon=True)
+        writer.start()
 
+        pending = {}
         try:
             while True:
                 try:
@@ -87,18 +90,16 @@ def DACWriterDaemon(lowChannelCallback, highChannelCallback, onConnect=None,
                     tag, samples = _readFrame(conn)
                 except ConnectionError:
                     return
-                if tag == b'L':
-                    lowQueue.put(samples)
-                elif tag == b'H':
-                    highQueue.put(samples)
+                if tag in (b'L', b'H'):
+                    pending[tag] = samples
+                    if b'L' in pending and b'H' in pending:
+                        frameQueue.put((pending.pop(b'L'), pending.pop(b'H')))
                 else:
                     print(f"unknown tag: {tag!r}")
         finally:
             # Drain remaining work and shut writers down cleanly.
-            lowQueue.put(None)
-            highQueue.put(None)
-            lowWriter.join()
-            highWriter.join()
+            frameQueue.put(None)
+            writer.join()
 
     # Runs the main daemon process
     def startDaemon():
