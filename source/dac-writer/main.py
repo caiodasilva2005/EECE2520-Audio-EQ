@@ -32,8 +32,8 @@ def configure_iio_buffer(sample_rate_hz):
     iio_sysfs_write("sample_rate_hz", int(sample_rate_hz))
 
     # Enable both DAC channels in the scan
-    iio_sysfs_write("scan_elements/in_voltage0_en", 1)
-    iio_sysfs_write("scan_elements/in_voltage1_en", 1)
+    iio_sysfs_write("scan_elements/out_voltage0_en", 1)
+    iio_sysfs_write("scan_elements/out_voltage1_en", 1)
 
     # Set kfifo depth and link our hrtimer trigger
     iio_sysfs_write("buffer/length", BUFFER_LEN)
