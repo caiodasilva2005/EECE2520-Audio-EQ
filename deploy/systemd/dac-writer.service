@@ -4,8 +4,6 @@ After=local-fs.target
 
 [Service]
 Type=simple
-User=audio-eq
-Group=audio-eq
 WorkingDirectory=/opt/EECE2520-Audio-EQ
 ExecStart=/opt/EECE2520-Audio-EQ/.venv/bin/python /opt/EECE2520-Audio-EQ/source/dac-writer/main.py
 RuntimeDirectory=audio-eq
