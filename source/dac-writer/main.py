@@ -28,6 +28,12 @@ def configure_iio_buffer(sample_rate_hz):
     The hrtimer in the kernel fires at sample_rate_hz and drains
     one sample per tick — no userspace timing needed at all.
     """
+
+    try:
+        iio_sysfs_write("buffer/enable", 0)
+    except OSError:
+        pass
+
     # Set the sample rate — kernel hrtimer handles all pacing from here
     iio_sysfs_write("sample_rate_hz", int(sample_rate_hz))
 
