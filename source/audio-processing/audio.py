@@ -36,7 +36,7 @@ class AudioProcessor:
             raise IOError(f"Error reading audio file: {e}")
 
         self._sos = self._buildSos()
-        self._zi = np.zeros((self._sos.shape[0], 2, self._soundFile.channels))
+        self._zi = np.zeros((self._sos.shape[0], 2))
 
         # Event is set when running, cleared when paused.
         self._pauseEvent = threading.Event()
@@ -58,13 +58,13 @@ class AudioProcessor:
     def setFilterOrder(self, filterOrder):
         self._filterOrder = filterOrder
         self._sos = self._buildSos()
-        self._zi = np.zeros((self._sos.shape[0], 2, self._soundFile.channels))
+        self._zi = np.zeros((self._sos.shape[0], 2))
 
     # sets the cutoff frequency and rebuilds the second-order sections for the Butterworth high-pass filter
     def setCutoffFrequency(self, cutoffFreq):
         self._cutoffFreq = cutoffFreq
         self._sos = self._buildSos()
-        self._zi = np.zeros((self._sos.shape[0], 2, self._soundFile.channels))
+        self._zi = np.zeros((self._sos.shape[0], 2))
 
     def setCallback(self, callback):
         self._callback = callback
@@ -109,6 +109,13 @@ class AudioProcessor:
               paused_for = time.monotonic() - pause_started
               start += paused_for
               print(f"[audio] block #{i}: resumed after {paused_for*1000:.1f}ms")
+
+          # Downmix to mono before filtering.  The DAC's two channels carry
+          # the low/high bands of one signal, so there is nowhere to send a
+          # stereo pair.  always_2d gives (frames, channels); averaging to
+          # (frames,) also prevents a stereo file from producing 2x the DAC
+          # frames, which made playback run at half real-time.
+          block = block.mean(axis=1)
 
           # Input block stats
           in_min = float(np.min(block))
