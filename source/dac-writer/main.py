@@ -20,38 +20,6 @@ def iio_sysfs_write(relative_path, value):
     with open(path, 'w') as f:
         f.write(str(value))
 
-
-def configure_iio_buffer(sample_rate_hz):
-    """
-    Configure the IIO triggered buffer once at startup.
-    This replaces the per-sample sysfs writes and time.sleep() pacing.
-    The hrtimer in the kernel fires at sample_rate_hz and drains
-    one sample per tick — no userspace timing needed at all.
-    """
-
-    try:
-        iio_sysfs_write("buffer/enable", 0)
-    except OSError:
-        pass
-
-    # Set the sample rate — kernel hrtimer handles all pacing from here
-    iio_sysfs_write("sample_rate_hz", int(sample_rate_hz))
-
-    # Enable both DAC channels in the scan
-    iio_sysfs_write("scan_elements/out_voltage0_en", 1)
-    iio_sysfs_write("scan_elements/out_voltage1_en", 1)
-
-    # Set kfifo depth and link our hrtimer trigger
-    iio_sysfs_write("buffer/length", BUFFER_LEN)
-    iio_sysfs_write("trigger/current_trigger", TRIGGER_NAME)
-
-    # Enable the buffer — this starts the hrtimer in the kernel
-    iio_sysfs_write("buffer/enable", 1)
-
-    print(f"[IIO] buffer configured: rate={sample_rate_hz}Hz "
-          f"trigger={TRIGGER_NAME} buffer_len={BUFFER_LEN}")
-
-
 def teardown_iio_buffer():
     """Stop the hrtimer and flush the kfifo on exit."""
     try:
@@ -83,7 +51,38 @@ class DAC:
             )
         self._name = name
         self._block_count = 0
+        self._initialized = False
+
         print(f"[{self._name}] opened {IIO_DEV}")
+    
+    def configure_iio_buffer(self, sample_rate_hz):
+        """
+        Configure the IIO triggered buffer once at startup.
+        This replaces the per-sample sysfs writes and time.sleep() pacing.
+        The hrtimer in the kernel fires at sample_rate_hz and drains
+        one sample per tick — no userspace timing needed at all.
+        """
+
+        self._initialized = False
+        
+        # Set the sample rate — kernel hrtimer handles all pacing from here
+        iio_sysfs_write("sample_rate_hz", int(sample_rate_hz))
+
+        # Enable both DAC channels in the scan
+        iio_sysfs_write("scan_elements/out_voltage0_en", 1)
+        iio_sysfs_write("scan_elements/out_voltage1_en", 1)
+
+        # Set kfifo depth and link our hrtimer trigger
+        iio_sysfs_write("buffer/length", BUFFER_LEN)
+        iio_sysfs_write("trigger/current_trigger", TRIGGER_NAME)
+
+        # Enable the buffer — this starts the hrtimer in the kernel
+        iio_sysfs_write("buffer/enable", 1)
+
+        self._initialized = True
+
+        print(f"[IIO] buffer configured: rate={sample_rate_hz}Hz "
+            f"trigger={TRIGGER_NAME} buffer_len={BUFFER_LEN}")
 
     def writeSamplesToDAC(self, samples_ch0, samples_ch1):
         """
@@ -99,6 +98,11 @@ class DAC:
         The kernel hrtimer pops one frame per tick at sample_rate_hz —
         no sleep() or deadline arithmetic needed here at all.
         """
+
+        if not self._initialized:
+            print("[DAC] buffer not ready yet, dropping block")
+            return
+        
         self._block_count += 1
         block_idx = self._block_count
 
@@ -144,7 +148,7 @@ def main():
 
     def set_sampling_frequency(sample_rate_hz):
         print("Set sampling frequency:", sample_rate_hz)
-        configure_iio_buffer(sample_rate_hz)
+        dac.configure_iio_buffer(sample_rate_hz)
 
     def write_samples(samples_ch0, samples_ch1):
         print("WRITING SAMPLES")
