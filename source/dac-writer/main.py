@@ -137,11 +137,16 @@ class DAC:
         while written < total:
             try:
                 n_written = self._dev.write(view[written:])
-                written += n_written
             except BlockingIOError:
-                # kfifo temporarily full — yield briefly and retry
-                # This should be rare with a well-sized BUFFER_LEN
+                # Buffered streams raise this when they can't proceed.
+                n_written = None
+            if n_written is None:
+                # A raw FileIO (buffering=0) under O_NONBLOCK returns None
+                # rather than raising when the kfifo can't take a single byte.
+                # Treat it as backpressure: yield briefly and retry.
                 time.sleep(0.001)
+                continue
+            written += n_written
 
         print(f"[{self._name}] block #{block_idx}: "
               f"wrote {n} frames ({total} bytes) in one syscall")
