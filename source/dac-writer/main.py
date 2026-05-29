@@ -64,6 +64,13 @@ class DAC:
         """
 
         self._initialized = False
+
+        try:
+            iio_sysfs_write("buffer/enable", 0)
+            print("[IIO] buffer disabled successfully")
+        except OSError as e:
+            print(f"[IIO] failed to disable buffer: {e}")
+            raise
         
         # Set the sample rate — kernel hrtimer handles all pacing from here
         iio_sysfs_write("sample_rate_hz", int(sample_rate_hz))
