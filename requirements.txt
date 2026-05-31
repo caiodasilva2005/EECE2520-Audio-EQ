@@ -2,3 +2,4 @@ numpy
 scipy
 soundfile
 dash
+ffmpeg

@@ -6,12 +6,21 @@ UI code stays free of audio/threading logic.
 
 from pathlib import Path
 
+import numpy as np
+from scipy import signal as sig
+import plotly.graph_objects as go
 from dash import Dash, html, dcc, Input, Output, State, no_update, ctx
 
 from controller import (
     PlaybackController,
     STATE_IDLE, STATE_PLAYING, STATE_PAUSED, STATE_DONE, STATE_ERROR,
 )
+
+# Spectrogram window. nperseg trades frequency vs time resolution; 1024 with
+# 75% overlap is a reasonable default for music-band signals.
+SPEC_NPERSEG = 1024
+SPEC_NOVERLAP = 768
+SPEC_DB_FLOOR = -80.0  # clamp dB so the colorbar isn't dominated by silence
 
 
 AUDIO_EXTS = {".wav", ".flac", ".ogg", ".mp3", ".aiff", ".aif"}
@@ -36,6 +45,52 @@ def scan_samples(samples_dir):
 
 def _file_options(samples_dir):
     return [{"label": Path(f).name, "value": f} for f in scan_samples(samples_dir)]
+
+
+def _empty_spectrogram(title):
+    fig = go.Figure()
+    fig.update_layout(
+        title=title,
+        xaxis_title="Time (s)",
+        yaxis_title="Frequency (Hz)",
+        margin={"l": 50, "r": 20, "t": 40, "b": 40},
+        height=240,
+        annotations=[{
+            "text": "(no audio captured yet)",
+            "xref": "paper", "yref": "paper",
+            "x": 0.5, "y": 0.5, "showarrow": False,
+            "font": {"color": "#888"},
+        }],
+    )
+    return fig
+
+
+def _spectrogram_figure(samples, sample_rate, title):
+    if sample_rate is None or samples.size < SPEC_NPERSEG:
+        return _empty_spectrogram(title)
+    f, t, Sxx = sig.spectrogram(
+        samples, fs=sample_rate,
+        nperseg=SPEC_NPERSEG, noverlap=SPEC_NOVERLAP,
+        scaling="spectrum",
+    )
+    Sxx_db = 10.0 * np.log10(Sxx + 1e-12)
+    Sxx_db = np.maximum(Sxx_db, SPEC_DB_FLOOR)
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=Sxx_db, x=t, y=f,
+            colorscale="Viridis",
+            zmin=SPEC_DB_FLOOR, zmax=0,
+            colorbar={"title": "dB"},
+        )
+    )
+    fig.update_layout(
+        title=title,
+        xaxis_title="Time (s)",
+        yaxis_title="Frequency (Hz)",
+        margin={"l": 50, "r": 20, "t": 40, "b": 40},
+        height=240,
+    )
+    return fig
 
 
 def _status_text(status):
@@ -113,7 +168,15 @@ def build_layout(samples_dir):
                     style={"background": "#f5f5f5", "padding": "12px",
                            "borderRadius": "6px", "whiteSpace": "pre-wrap"}),
 
+            html.H3("Spectrograms", style={"marginTop": "24px"}),
+            dcc.Graph(id="spec-original", figure=_empty_spectrogram("Original signal")),
+            dcc.Graph(id="spec-low", figure=_empty_spectrogram("Low band")),
+            dcc.Graph(id="spec-high", figure=_empty_spectrogram("High band")),
+
             dcc.Interval(id="status-tick", interval=500, n_intervals=0),
+            # Spectrograms recompute on a slower tick than the status line
+            # because the FFT + plotly redraw is more expensive.
+            dcc.Interval(id="spec-tick", interval=1000, n_intervals=0),
         ],
     )
 
@@ -178,6 +241,20 @@ def register_callbacks(app, controller, samples_dir):
     )
     def on_tick(_):
         return _status_text(controller.status())
+
+    @app.callback(
+        Output("spec-original", "figure"),
+        Output("spec-low", "figure"),
+        Output("spec-high", "figure"),
+        Input("spec-tick", "n_intervals"),
+    )
+    def on_spec_tick(_):
+        raw, lf, hf, sr = controller.recent_audio()
+        return (
+            _spectrogram_figure(raw, sr, "Original signal"),
+            _spectrogram_figure(lf, sr, "Low band"),
+            _spectrogram_figure(hf, sr, "High band"),
+        )
 
 
 def create_app(controller, samples_dir):

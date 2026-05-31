@@ -5,7 +5,10 @@ processAudio on a worker thread so Dash callbacks can poke the processor
 
 import sys
 import threading
+from collections import deque
 from pathlib import Path
+
+import numpy as np
 
 # Make the sibling audio-processing package importable. The directory name has
 # a hyphen, so a normal `import` won't work; sys.path is the simplest fix
@@ -15,6 +18,11 @@ sys.path.insert(0, str(_AUDIO_DIR))
 
 from audio import AudioProcessor                      # noqa: E402
 from audioClient import AudioClient, DEFAULT_SOCKET_PATH  # noqa: E402
+
+# Block size in AudioProcessor is 1024 samples. At 44.1 kHz, 256 blocks is
+# ~5.9 s — enough context for a readable spectrogram, small enough that
+# recomputing on the UI tick is cheap.
+CAPTURE_BLOCKS = 256
 
 
 STATE_IDLE = "idle"
@@ -41,6 +49,14 @@ class PlaybackController:
         self._connected = False
         self._state = STATE_IDLE
         self._error = None
+
+        # Capture buffers are written by the audio thread (via _capture_block)
+        # and read by the Dash interval callback. deque is thread-safe for
+        # append; the snapshot lock protects multi-deque consistency on read.
+        self._capture_lock = threading.Lock()
+        self._buf_lf = deque(maxlen=CAPTURE_BLOCKS)
+        self._buf_hf = deque(maxlen=CAPTURE_BLOCKS)
+        self._sample_rate = None
 
     # The audio thread can outlive a "stop" because AudioProcessor has no stop
     # primitive — pausing it just parks it on a threading.Event. We let the
@@ -73,8 +89,23 @@ class PlaybackController:
             self._thread = None
             self._state = STATE_IDLE
             self._error = None
+            self._sample_rate = self._processor.getSamplingFrequency()
+            with self._capture_lock:
+                self._buf_lf.clear()
+                self._buf_hf.clear()
 
     def start(self):
+        # If the previous play ran to the end or errored, the SoundFile is at
+        # EOF and another processAudio call would iterate zero blocks — which
+        # crashes AudioProcessor's final print on an undefined `i`. Re-open
+        # the file from scratch in that case.
+        with self._lock:
+            needs_reload = self._state in (STATE_DONE, STATE_ERROR) and \
+                self._current_file is not None
+            reload_path = self._current_file if needs_reload else None
+        if needs_reload:
+            self.load(reload_path)
+
         with self._lock:
             if self._processor is None:
                 self._error = "No file loaded."
@@ -87,21 +118,31 @@ class PlaybackController:
                 return
 
             client = AudioClient(self._processor)
+            dac_cb = None
             try:
                 client.connectToDacWriterDaemon(self._socket_path)
                 self._connected = True
                 self._client = client
+                # AudioClient set its own callback on the processor during
+                # connect. We override it with a chained callback that also
+                # captures into the spectrogram ring buffer.
+                dac_cb = client._sendAudioBlockToDaemon
             except (FileNotFoundError, ConnectionRefusedError, OSError) as e:
                 if not self._dry_run:
                     self._error = f"Daemon connect failed: {e}"
                     self._state = STATE_ERROR
                     return
-                # Dry-run: skip the socket and install a no-op callback so
-                # AudioProcessor still iterates blocks in real time. The
-                # slider remains live; you just don't hear anything.
-                self._processor.setCallback(lambda hf, lf: None)
+                # Dry-run: AudioProcessor still iterates blocks in real time
+                # so the slider stays live and the spectrograms still update;
+                # you just don't hear anything.
                 self._connected = False
                 self._client = None
+
+            def chained(hf, lf, _dac=dac_cb):
+                self._capture_block(hf, lf)
+                if _dac is not None:
+                    _dac(hf, lf)
+            self._processor.setCallback(chained)
 
             self._state = STATE_PLAYING
             self._error = None
@@ -153,6 +194,28 @@ class PlaybackController:
             self._order = int(n)
             if self._state in (STATE_IDLE, STATE_DONE) and self._processor is not None:
                 self._processor.setFilterOrder(self._order)
+
+    def _capture_block(self, hf, lf):
+        # Called on the audio thread once per block. Copy because hf/lf alias
+        # AudioProcessor's internal buffers, which it reuses next block.
+        with self._capture_lock:
+            self._buf_hf.append(np.asarray(hf, dtype=np.float32).copy())
+            self._buf_lf.append(np.asarray(lf, dtype=np.float32).copy())
+
+    def recent_audio(self):
+        """Return (raw, low, high, sample_rate) for the most recent window.
+        Arrays are empty if nothing has been captured yet. raw is reconstructed
+        as low + high (AudioProcessor's split is exact: lf = block - hf)."""
+        with self._capture_lock:
+            if not self._buf_lf:
+                return (np.empty(0, dtype=np.float32),
+                        np.empty(0, dtype=np.float32),
+                        np.empty(0, dtype=np.float32),
+                        self._sample_rate)
+            lf = np.concatenate(list(self._buf_lf))
+            hf = np.concatenate(list(self._buf_hf))
+        raw = lf + hf
+        return raw, lf, hf, self._sample_rate
 
     def status(self):
         with self._lock:
