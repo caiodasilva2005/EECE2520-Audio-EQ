@@ -39,6 +39,21 @@ class DAC:
         A single DAC instance now represents both channels together,
         since the IIO buffer interleaves ch0 and ch1 in the same write().
         """
+        # The device fd is opened per buffer-enable cycle in
+        # configure_iio_buffer(), not here: the IIO char device must be
+        # (re)opened *after* the buffer is reconfigured/re-enabled, otherwise a
+        # stale fd left over from a previous buffer/enable cycle keeps writing
+        # into a kfifo the re-armed hrtimer trigger no longer drains, and the
+        # writer thread blocks forever on a full buffer.
+        self._dev = None
+        self._name = name
+        self._block_count = 0
+        self._initialized = False
+
+
+    def _open_dev(self):
+        """Open the IIO char device fd, closing any previous one first."""
+        self._close_dev()
         try:
             # O_WRONLY | O_NONBLOCK so write() returns EAGAIN instead of
             # blocking forever if the kfifo is completely full
@@ -49,12 +64,16 @@ class DAC:
                 f"Failed to open IIO device {IIO_DEV}: {e}\n"
                 "Is the kernel module loaded and buffer enabled?"
             )
-        self._name = name
-        self._block_count = 0
-        self._initialized = False
-
         print(f"[{self._name}] opened {IIO_DEV}")
-    
+
+    def _close_dev(self):
+        if self._dev is not None:
+            try:
+                self._dev.close()
+            except OSError as e:
+                print(f"[{self._name}] close warning: {e}")
+            self._dev = None
+
     def configure_iio_buffer(self, sample_rate_hz):
         """
         Configure the IIO triggered buffer once at startup.
@@ -65,13 +84,18 @@ class DAC:
 
         self._initialized = False
 
+        # Release any fd from a previous enable cycle before tearing the buffer
+        # down — the new kfifo allocated on re-enable must be fed by a freshly
+        # opened fd, never one left over from the last song.
+        self._close_dev()
+
         try:
             iio_sysfs_write("buffer/enable", 0)
             print("[IIO] buffer disabled successfully")
         except OSError as e:
             print(f"[IIO] failed to disable buffer: {e}")
             raise
-        
+
         # Set the sample rate — kernel hrtimer handles all pacing from here
         iio_sysfs_write("sample_rate_hz", int(sample_rate_hz))
 
@@ -85,6 +109,12 @@ class DAC:
 
         # Enable the buffer — this starts the hrtimer in the kernel
         iio_sysfs_write("buffer/enable", 1)
+
+        # Open the char device fd against the now-enabled buffer. Doing this
+        # here (rather than once at construction) is what lets a second song
+        # play: the fd is bound to this enable cycle's kfifo, so writes land in
+        # the buffer the hrtimer is actively draining.
+        self._open_dev()
 
         self._initialized = True
 
@@ -152,7 +182,7 @@ class DAC:
               f"wrote {n} frames ({total} bytes) in one syscall")
 
     def close(self):
-        self._dev.close()
+        self._close_dev()
 
 
 def main():
