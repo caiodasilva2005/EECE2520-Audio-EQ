@@ -12,6 +12,8 @@ def main():
     # Initialize audio processor
     audioProcesser = AudioProcessor(args.audio_file)
 
+    audioProcesser.setCutoffFrequency(0);
+
     # Initialize audio client 
     client = AudioClient(audioProcesser)
 

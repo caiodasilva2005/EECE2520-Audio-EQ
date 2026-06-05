@@ -26,12 +26,14 @@ fi
 "${INSTALL_ROOT}/.venv/bin/pip" install --upgrade pip
 "${INSTALL_ROOT}/.venv/bin/pip" install -r "${INSTALL_ROOT}/requirements.txt"
 
-# 3. Systemd unit
+# 3. Systemd units
 ln -sf "${INSTALL_ROOT}/deploy/systemd/dac-writer.service" /etc/systemd/system/dac-writer.service
+ln -sf "${INSTALL_ROOT}/deploy/systemd/frontend.service" /etc/systemd/system/frontend.service
 
 # 4. Enable + start
 systemctl daemon-reload
 systemctl enable --now dac-writer.service
+systemctl enable --now frontend.service
 
 echo
 echo "Done installing Audio-EQ services"                      

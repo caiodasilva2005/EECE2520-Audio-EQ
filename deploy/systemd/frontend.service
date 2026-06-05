@@ -1,0 +1,19 @@
+[Unit]
+Description=Audio-EQ Dash frontend (gunicorn)
+After=network.target dac-writer.service
+Wants=dac-writer.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/EECE2520-Audio-EQ/source/frontend
+Environment=FRONTEND_SAMPLES=/opt/EECE2520-Audio-EQ/samples
+ExecStart=/opt/EECE2520-Audio-EQ/.venv/bin/gunicorn \
+    --workers 1 \
+    --threads 4 \
+    --bind 0.0.0.0:8050 \
+    wsgi:server
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

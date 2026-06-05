@@ -2,4 +2,5 @@ numpy
 scipy
 soundfile
 dash
+gunicorn
 ffmpeg
