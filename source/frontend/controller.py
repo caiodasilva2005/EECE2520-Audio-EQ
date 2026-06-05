@@ -1,272 +1,195 @@
-"""Playback controller that owns an AudioProcessor + AudioClient and runs
-processAudio on a worker thread so Dash callbacks can poke the processor
-(slider drag, pause/resume) without blocking the web event loop.
+"""Playback controller.
+
+This is a thin proxy in the web-server process. The actual audio engine
+(AudioProcessor + AudioClient) runs in a separate child process (audio_worker)
+so the GUI's per-tick spectrogram FFT + Plotly JSON serialization can't share a
+GIL with — and therefore can't stall — the real-time DAC streaming. The proxy
+just forwards control commands and reads back state/audio over shared memory.
+
+The public API (load/start/pause/resume/set_cutoff/set_position/set_order/
+status/recent_audio/sampling_frequency) is unchanged, so the Dash layer is
+unaffected by the process split.
 """
 
-import sys
+import atexit
+import queue
 import threading
-from collections import deque
-from pathlib import Path
+from multiprocessing import get_context, shared_memory
 
 import numpy as np
 
-# Make the sibling audio-processing package importable. The directory name has
-# a hyphen, so a normal `import` won't work; sys.path is the simplest fix
-# without restructuring the user's existing layout.
-_AUDIO_DIR = Path(__file__).resolve().parent.parent / "audio-processing"
-sys.path.insert(0, str(_AUDIO_DIR))
+from audio_worker import (
+    audio_worker_main,
+    DEFAULT_SOCKET_PATH,
+    STATE_IDLE, STATE_PLAYING, STATE_PAUSED, STATE_DONE, STATE_ERROR,
+    BLOCK_SIZE, CAPTURE_BLOCKS, CAPTURE_SHAPE, CAPTURE_DTYPE, CAPTURE_NBYTES,
+)
 
-from audio import AudioProcessor                      # noqa: E402
-from audioClient import AudioClient, DEFAULT_SOCKET_PATH  # noqa: E402
+# Re-exported so app.py / wsgi.py keep importing these from controller.
+__all__ = [
+    "PlaybackController", "DEFAULT_SOCKET_PATH",
+    "STATE_IDLE", "STATE_PLAYING", "STATE_PAUSED", "STATE_DONE", "STATE_ERROR",
+]
 
-# Block size in AudioProcessor is 1024 samples. At 44.1 kHz, 256 blocks is
-# ~5.9 s — enough context for a readable spectrogram, small enough that
-# recomputing on the UI tick is cheap.
-CAPTURE_BLOCKS = 256
-
-
-STATE_IDLE = "idle"
-STATE_PLAYING = "playing"
-STATE_PAUSED = "paused"
-STATE_DONE = "done"
-STATE_ERROR = "error"
+_LOAD_TIMEOUT = 10.0   # seconds to wait for the worker to open a new file
 
 
 class PlaybackController:
     def __init__(self, socket_path=DEFAULT_SOCKET_PATH, dry_run=False,
                  default_cutoff=1000, default_order=10):
-        self._socket_path = socket_path
         self._dry_run = dry_run
-        self._lock = threading.Lock()
 
-        self._processor = None
-        self._client = None
-        self._thread = None
+        # 'fork' (Linux default) is used and the worker is spawned here at
+        # construction time — which under gunicorn is import time, before any
+        # request threads are doing real work — to keep the fork-with-threads
+        # hazard minimal while avoiding spawn's __main__ re-import quirks.
+        ctx = get_context("fork")
+        self._cmd_q = ctx.Queue()
+        self._status_q = ctx.Queue()
+        self._ack_q = ctx.Queue()
+        self._pos = ctx.Value("i", 0)          # current block (written per block)
+        self._cap_count = ctx.Value("L", 0)    # capture ring write counter
 
-        self._current_file = None
-        self._cutoff = default_cutoff
-        self._order = default_order
-        self._connected = False
-        self._state = STATE_IDLE
-        self._error = None
+        # Shared ring for the spectrograms. Created here (parent), attached by
+        # name in the child; the parent reads it directly so the audio thread is
+        # never blocked by the GUI.
+        self._shm = shared_memory.SharedMemory(create=True, size=CAPTURE_NBYTES)
+        self._ring = np.ndarray(CAPTURE_SHAPE, dtype=CAPTURE_DTYPE,
+                                buffer=self._shm.buf)
 
-        # Capture buffers are written by the audio thread (via _capture_block)
-        # and read by the Dash interval callback. deque is thread-safe for
-        # append; the snapshot lock protects multi-deque consistency on read.
-        self._capture_lock = threading.Lock()
-        self._buf_lf = deque(maxlen=CAPTURE_BLOCKS)
-        self._buf_hf = deque(maxlen=CAPTURE_BLOCKS)
-        self._sample_rate = None
+        # Local cache of the worker's last-reported status, kept current by a
+        # background thread draining status_q. status() reads this plus the live
+        # position value, so it never blocks on IPC round-trips.
+        self._cache_lock = threading.Lock()
+        self._status_cache = {
+            "state": STATE_IDLE, "file": None, "cutoff": default_cutoff,
+            "order": default_order, "connected": False, "dry_run": dry_run,
+            "error": None, "total_blocks": 0, "sample_rate": 0,
+            "duration_seconds": 0.0,
+        }
 
-    # Loading a new file stops and disconnects any active playback first. The
-    # DAC daemon serves one client at a time and won't accept the next file's
-    # connection until the current one closes, so a clean stop+disconnect (not
-    # just a pause) is required for the new file to be able to play.
-    def load(self, filepath):
-        with self._lock:
-            # Tell the old worker to exit its loop, then close its socket. The
-            # worker treats a stop as a clean exit (no done/error callback, no
-            # self._lock), so closing the socket here can't deadlock against it
-            # even if it's mid-send when the socket drops out from under it.
-            if self._thread is not None and self._thread.is_alive():
-                self._processor.stop()
-            if self._client is not None:
-                self._client.disconnect()
+        self._proc = ctx.Process(
+            target=audio_worker_main,
+            args=(self._cmd_q, self._status_q, self._ack_q, self._pos,
+                  self._cap_count, self._shm.name, socket_path, dry_run,
+                  default_cutoff, default_order),
+            name="audio-worker", daemon=True,
+        )
+        self._proc.start()
 
-            try:
-                self._processor = AudioProcessor(
-                    filepath,
-                    cutoffFreq=self._cutoff,
-                    filterOrder=self._order,
-                )
-            except IOError as e:
-                self._state = STATE_ERROR
-                self._error = str(e)
-                self._processor = None
-                self._current_file = None
+        self._reader = threading.Thread(
+            target=self._drain_status, name="status-reader", daemon=True)
+        self._reader.start()
+
+        self._closed = False
+        atexit.register(self.close)
+
+    def _drain_status(self):
+        while True:
+            snap = self._status_q.get()
+            if snap is None:
                 return
+            with self._cache_lock:
+                self._status_cache.update(snap)
 
-            self._current_file = filepath
-            self._client = None
-            self._connected = False
-            self._thread = None
-            self._state = STATE_IDLE
-            self._error = None
-            self._sample_rate = self._processor.getSamplingFrequency()
-            with self._capture_lock:
-                self._buf_lf.clear()
-                self._buf_hf.clear()
+    # ---- control (fire-and-forget commands) -------------------------------
+
+    def load(self, filepath):
+        # Synchronous: the upload callback reads the new file's sample rate right
+        # after, so wait for the worker to finish opening it (or error/timeout).
+        self._cmd_q.put(("load", filepath))
+        try:
+            snap = self._ack_q.get(timeout=_LOAD_TIMEOUT)
+            with self._cache_lock:
+                self._status_cache.update(snap)
+        except queue.Empty:
+            pass
 
     def start(self):
-        # If the previous play ran to the end or errored, the SoundFile is at
-        # EOF and another processAudio call would iterate zero blocks — which
-        # crashes AudioProcessor's final print on an undefined `i`. Re-open
-        # the file from scratch in that case.
-        with self._lock:
-            needs_reload = self._state in (STATE_DONE, STATE_ERROR) and \
-                self._current_file is not None
-            reload_path = self._current_file if needs_reload else None
-        if needs_reload:
-            self.load(reload_path)
-
-        with self._lock:
-            if self._processor is None:
-                self._error = "No file loaded."
-                self._state = STATE_ERROR
-                return
-            if self._state == STATE_PLAYING:
-                return
-            if self._thread is not None and self._thread.is_alive():
-                # Could be paused — caller should use resume() instead.
-                return
-
-            client = AudioClient(self._processor)
-            dac_cb = None
-            try:
-                client.connectToDacWriterDaemon(self._socket_path)
-                self._connected = True
-                self._client = client
-                # AudioClient set its own callback on the processor during
-                # connect. We override it with a chained callback that also
-                # captures into the spectrogram ring buffer.
-                dac_cb = client._sendAudioBlockToDaemon
-            except (FileNotFoundError, ConnectionRefusedError, OSError) as e:
-                if not self._dry_run:
-                    self._error = f"Daemon connect failed: {e}"
-                    self._state = STATE_ERROR
-                    return
-                # Dry-run: AudioProcessor still iterates blocks in real time
-                # so the slider stays live and the spectrograms still update;
-                # you just don't hear anything.
-                self._connected = False
-                self._client = None
-
-            def chained(hf, lf, _dac=dac_cb):
-                self._capture_block(hf, lf)
-                if _dac is not None:
-                    _dac(hf, lf)
-            self._processor.setCallback(chained)
-
-            self._state = STATE_PLAYING
-            self._error = None
-            # Hand the processor and client to the worker explicitly so its
-            # lifecycle is decoupled from self._processor/self._client, which a
-            # concurrent load() may swap out.
-            self._thread = threading.Thread(
-                target=self._run, args=(self._processor, self._client),
-                name="audio-playback", daemon=True,
-            )
-            self._thread.start()
-
-    def _run(self, processor, client):
-        try:
-            processor.processAudio(done_callback=self._on_done)
-        except Exception as e:
-            # A stop() (file swap) is a clean exit; only a genuine failure
-            # surfaces as error state. Skipping the lock on the stop path keeps
-            # load()'s socket-close from deadlocking against this thread.
-            if not processor.isStopped():
-                with self._lock:
-                    self._state = STATE_ERROR
-                    self._error = str(e)
-        finally:
-            # This run owns its connection — close it on exit so the daemon is
-            # free for the next file. Idempotent with load()'s disconnect().
-            if client is not None:
-                client.disconnect()
-
-    def _on_done(self):
-        with self._lock:
-            if self._state != STATE_ERROR:
-                self._state = STATE_DONE
+        self._cmd_q.put(("start",))
 
     def pause(self):
-        with self._lock:
-            if self._processor is not None and self._state == STATE_PLAYING:
-                self._processor.pause()
-                self._state = STATE_PAUSED
+        self._cmd_q.put(("pause",))
 
     def resume(self):
-        with self._lock:
-            if self._processor is not None and self._state == STATE_PAUSED:
-                self._processor.resume()
-                self._state = STATE_PLAYING
+        self._cmd_q.put(("resume",))
 
     def set_cutoff(self, hz):
-        # Cheap and safe to call mid-playback: AudioProcessor.setCutoffFrequency
-        # rebuilds the SOS and zeros the filter state. The number of sections
-        # is unchanged (filter order is fixed during playback), so the shapes
-        # the audio thread reads always match.
-        with self._lock:
-            self._cutoff = int(hz)
-            if self._processor is not None:
-                self._processor.setCutoffFrequency(self._cutoff)
+        self._cmd_q.put(("cutoff", int(hz)))
 
     def set_position(self, block_index):
-        # Safe to call mid-playback, paused, or idle: AudioProcessor.seek just
-        # records a pending block index that the audio loop honors on its next
-        # iteration (or on resume / first play).
-        with self._lock:
-            if self._processor is not None:
-                self._processor.seek(int(block_index))
+        self._cmd_q.put(("seek", int(block_index)))
 
     def set_order(self, n):
-        # Changing order changes SOS shape and can race the audio thread's
-        # sosfilt call. Only apply when nothing is actively playing; the UI
-        # should disable this control during playback.
-        with self._lock:
-            self._order = int(n)
-            if self._state in (STATE_IDLE, STATE_DONE) and self._processor is not None:
-                self._processor.setFilterOrder(self._order)
+        self._cmd_q.put(("order", int(n)))
 
-    def _capture_block(self, hf, lf):
-        # Called on the audio thread once per block. Copy because hf/lf alias
-        # AudioProcessor's internal buffers, which it reuses next block.
-        with self._capture_lock:
-            self._buf_hf.append(np.asarray(hf, dtype=np.float32).copy())
-            self._buf_lf.append(np.asarray(lf, dtype=np.float32).copy())
-
-    def recent_audio(self):
-        """Return (raw, low, high, sample_rate) for the most recent window.
-        Arrays are empty if nothing has been captured yet. raw is reconstructed
-        as low + high (AudioProcessor's split is exact: lf = block - hf)."""
-        with self._capture_lock:
-            if not self._buf_lf:
-                return (np.empty(0, dtype=np.float32),
-                        np.empty(0, dtype=np.float32),
-                        np.empty(0, dtype=np.float32),
-                        self._sample_rate)
-            lf = np.concatenate(list(self._buf_lf))
-            hf = np.concatenate(list(self._buf_hf))
-        raw = lf + hf
-        return raw, lf, hf, self._sample_rate
-
-    def sampling_frequency(self):
-        """Sample rate (Hz) of the currently loaded file, or None if nothing is
-        loaded. Set by load() from AudioProcessor.getSamplingFrequency()."""
-        with self._lock:
-            return self._sample_rate
+    # ---- readback ---------------------------------------------------------
 
     def status(self):
-        with self._lock:
-            if self._processor is not None:
-                position = self._processor.getCurrentBlock()
-                total_blocks = self._processor.getTotalBlocks()
-                position_seconds = self._processor.getCurrentSeconds()
-                duration_seconds = self._processor.getDurationSeconds()
-            else:
-                position = total_blocks = 0
-                position_seconds = duration_seconds = 0.0
-            return {
-                "state": self._state,
-                "file": self._current_file,
-                "cutoff": self._cutoff,
-                "order": self._order,
-                "connected": self._connected,
-                "dry_run": self._dry_run,
-                "error": self._error,
-                "position": position,
-                "total_blocks": total_blocks,
-                "position_seconds": position_seconds,
-                "duration_seconds": duration_seconds,
-            }
+        with self._cache_lock:
+            s = dict(self._status_cache)
+        sr = s.get("sample_rate") or 0
+        pos = self._pos.value
+        s["position"] = pos
+        s["position_seconds"] = pos * BLOCK_SIZE / sr if sr else 0.0
+        s.setdefault("duration_seconds", 0.0)
+        return s
+
+    def sampling_frequency(self):
+        with self._cache_lock:
+            sr = self._status_cache.get("sample_rate") or 0
+        return sr or None
+
+    def recent_audio(self):
+        """Return (raw, low, high, sample_rate) for the most recent window by
+        reading the shared ring directly (no contact with the audio process).
+        raw is reconstructed as low + high (the band split is exact)."""
+        sr = self.sampling_frequency()
+        c = self._cap_count.value
+        if c == 0:
+            empty = np.empty(0, dtype=np.float32)
+            return empty, empty, empty, sr
+        n = min(c, CAPTURE_BLOCKS)
+        start = c - n
+        idx = [(start + k) % CAPTURE_BLOCKS for k in range(n)]
+        # Fancy indexing copies, so this is a stable snapshot even as the worker
+        # keeps writing; at worst the newest block is momentarily torn, which is
+        # invisible in a spectrogram.
+        window = self._ring[idx]                       # (n, 2, BLOCK_SIZE)
+        lf = window[:, 0, :].reshape(-1)
+        hf = window[:, 1, :].reshape(-1)
+        raw = lf + hf
+        return raw, lf, hf, sr
+
+    # ---- lifecycle --------------------------------------------------------
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._cmd_q.put(("quit",))
+        except (ValueError, OSError):
+            pass
+        if self._proc.is_alive():
+            self._proc.join(timeout=2)
+            if self._proc.is_alive():
+                self._proc.terminate()
+        try:
+            self._status_q.put(None)       # unblock the reader thread
+        except (ValueError, OSError):
+            pass
+        self._reader.join(timeout=1)
+        # Drop each queue's background feeder thread so it can't hold a lock at
+        # interpreter shutdown (the source of "_enter_buffered_busy" fatals).
+        for q in (self._cmd_q, self._status_q, self._ack_q):
+            try:
+                q.cancel_join_thread()
+                q.close()
+            except (ValueError, OSError):
+                pass
+        try:
+            self._shm.close()
+            self._shm.unlink()
+        except (FileNotFoundError, OSError):
+            pass
