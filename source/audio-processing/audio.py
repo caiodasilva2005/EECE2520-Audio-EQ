@@ -54,6 +54,11 @@ class AudioProcessor:
         self._pauseEvent = threading.Event()
         self._pauseEvent.set()
 
+        # Set to ask processAudio to break out of its loop and return. Used when
+        # swapping files so the old worker exits (and its socket can be closed)
+        # instead of being parked on the pause event for the process lifetime.
+        self._stopEvent = threading.Event()
+
     # builds the second-order sections for the Butterworth high-pass filter based on the cutoff frequency and filter order
     def _buildSos(self):
         return sig.butter(self._filterOrder, self._cutoffFreq, 'hp',
@@ -91,6 +96,15 @@ class AudioProcessor:
 
     def isPaused(self):
         return not self._pauseEvent.is_set()
+
+    # Asks processAudio to stop and return. Also unparks a paused worker so it
+    # can observe the stop and exit. Safe to call from another thread.
+    def stop(self):
+        self._stopEvent.set()
+        self._pauseEvent.set()
+
+    def isStopped(self):
+        return self._stopEvent.is_set()
 
     # Requests a jump to the given block index; safe to call from another
     # thread. The seek is applied by processAudio on its next iteration (or on
@@ -141,6 +155,13 @@ class AudioProcessor:
               self._pauseEvent.wait()
               paused_for = time.monotonic() - pause_started
               start += paused_for
+
+          # Exit cleanly if asked to stop (e.g. a new file is being loaded).
+          # Checked after the pause wait so a stopped-while-paused worker also
+          # wakes and breaks, and before reading/sending so we never touch a
+          # socket the caller is about to close.
+          if self.isStopped():
+              break
 
           # Apply a pending seek (requested by seek() from the Dash thread).
           with self._seekLock:
@@ -215,5 +236,7 @@ class AudioProcessor:
         print(f"[audio] done: {i} blocks, {total_ms:.1f}ms elapsed, "
               f"{behind_count} blocks missed deadline")
 
-        if done_callback is not None:
+        # Skip the done callback if we were stopped to swap files: the caller has
+        # already moved on to the new file and we must not clobber its state.
+        if done_callback is not None and not self.isStopped():
             done_callback()

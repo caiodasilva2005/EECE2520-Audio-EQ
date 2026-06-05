@@ -24,6 +24,23 @@ class AudioClient():
 
         self._connected = True
 
+    # Closes the connection to the DAC writer daemon. The daemon handles one
+    # client at a time and only returns to accept() once the current peer
+    # disconnects, so closing here frees it to serve the next file. Safe to call
+    # more than once.
+    def disconnect(self):
+        if not self._connected:
+            return
+        self._connected = False
+        try:
+            self._socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self._socket.close()
+        except OSError:
+            pass
+
     def _sendAudioBlockToDaemon(self, highFrequencyChannel, lowFrequencyChannel):
         # Send low frequency channel with tag 'L'
         self._socket.sendall(struct.pack(HEADER_FMT, b'L', lowFrequencyChannel.nbytes))

@@ -58,17 +58,20 @@ class PlaybackController:
         self._buf_hf = deque(maxlen=CAPTURE_BLOCKS)
         self._sample_rate = None
 
-    # The audio thread can outlive a "stop" because AudioProcessor has no stop
-    # primitive — pausing it just parks it on a threading.Event. We let the
-    # old worker linger as a daemon thread; it dies with the process. Loading
-    # a new file drops the reference and the new processor takes over.
+    # Loading a new file stops and disconnects any active playback first. The
+    # DAC daemon serves one client at a time and won't accept the next file's
+    # connection until the current one closes, so a clean stop+disconnect (not
+    # just a pause) is required for the new file to be able to play.
     def load(self, filepath):
         with self._lock:
-            if self._thread is not None and self._thread.is_alive() and \
-                    self._state == STATE_PLAYING:
-                # Park the old worker before swapping. It'll sit on the
-                # pause event for the rest of the process lifetime.
-                self._processor.pause()
+            # Tell the old worker to exit its loop, then close its socket. The
+            # worker treats a stop as a clean exit (no done/error callback, no
+            # self._lock), so closing the socket here can't deadlock against it
+            # even if it's mid-send when the socket drops out from under it.
+            if self._thread is not None and self._thread.is_alive():
+                self._processor.stop()
+            if self._client is not None:
+                self._client.disconnect()
 
             try:
                 self._processor = AudioProcessor(
@@ -146,18 +149,31 @@ class PlaybackController:
 
             self._state = STATE_PLAYING
             self._error = None
+            # Hand the processor and client to the worker explicitly so its
+            # lifecycle is decoupled from self._processor/self._client, which a
+            # concurrent load() may swap out.
             self._thread = threading.Thread(
-                target=self._run, name="audio-playback", daemon=True,
+                target=self._run, args=(self._processor, self._client),
+                name="audio-playback", daemon=True,
             )
             self._thread.start()
 
-    def _run(self):
+    def _run(self, processor, client):
         try:
-            self._processor.processAudio(done_callback=self._on_done)
+            processor.processAudio(done_callback=self._on_done)
         except Exception as e:
-            with self._lock:
-                self._state = STATE_ERROR
-                self._error = str(e)
+            # A stop() (file swap) is a clean exit; only a genuine failure
+            # surfaces as error state. Skipping the lock on the stop path keeps
+            # load()'s socket-close from deadlocking against this thread.
+            if not processor.isStopped():
+                with self._lock:
+                    self._state = STATE_ERROR
+                    self._error = str(e)
+        finally:
+            # This run owns its connection — close it on exit so the daemon is
+            # free for the next file. Idempotent with load()'s disconnect().
+            if client is not None:
+                client.disconnect()
 
     def _on_done(self):
         with self._lock:
