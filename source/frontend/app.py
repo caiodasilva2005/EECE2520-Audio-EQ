@@ -22,7 +22,7 @@ from controller import (
 # Spectrogram window. nperseg trades frequency vs time resolution; 1024 with
 # 75% overlap is a reasonable default for music-band signals.
 SPEC_NPERSEG = 1024
-SPEC_NOVERLAP = 768
+SPEC_NOVERLAP = 512   # 50% overlap: fewer FFT segments (we downsample time anyway)
 SPEC_DB_FLOOR = -80.0  # clamp dB so the colorbar isn't dominated by silence
 
 # The figures are sent to the browser as JSON every spec-tick and redrawn by

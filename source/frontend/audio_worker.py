@@ -281,7 +281,14 @@ class _AudioEngine:
         with self._lock:
             if self._processor is not None:
                 self._processor.seek(int(block_index))
-        # No status post: pos updates continuously via the shared value.
+                # Publish the new position immediately. While playing the audio
+                # thread overwrites this within a block anyway, but while paused
+                # (or idle) it's parked and won't apply the seek or update pos
+                # until resume — without this the status tick reads the stale
+                # position and snaps the slider back to where it was.
+                total = self._processor.getTotalBlocks()
+                self._pos.value = max(0, min(int(block_index), max(total - 1, 0)))
+        # No status post: the position is carried by the shared pos value.
 
     # ---- main loop --------------------------------------------------------
 
