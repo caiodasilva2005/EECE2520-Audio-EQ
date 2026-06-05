@@ -25,6 +25,14 @@ SPEC_NPERSEG = 1024
 SPEC_NOVERLAP = 768
 SPEC_DB_FLOOR = -80.0  # clamp dB so the colorbar isn't dominated by silence
 
+# The figures are sent to the browser as JSON every spec-tick and redrawn by
+# Plotly. A full-resolution spectrogram is ~0.5M values (~3 MB JSON each), which
+# both holds the server's GIL during serialization (stalling control callbacks)
+# and bogs the browser's render loop. Downsampling the matrix to these caps and
+# rounding to 1 dB keeps the picture readable while shrinking the payload ~30x.
+SPEC_MAX_T = 160   # max time columns sent
+SPEC_MAX_F = 200   # max frequency rows sent
+
 
 # Highpass cutoff must satisfy 0 < f < Nyquist (sample_rate / 2). Nyquist is
 # only known once a file is uploaded, so the slider's max/marks are set from
@@ -104,6 +112,15 @@ def _spectrogram_figure(samples, sample_rate, title):
     )
     Sxx_db = 10.0 * np.log10(Sxx + 1e-12)
     Sxx_db = np.maximum(Sxx_db, SPEC_DB_FLOOR)
+
+    # Downsample (stride) and round before handing off to Plotly to keep the
+    # JSON payload small — this is what keeps the UI responsive.
+    f_step = max(1, len(f) // SPEC_MAX_F)
+    t_step = max(1, len(t) // SPEC_MAX_T)
+    Sxx_db = np.round(Sxx_db[::f_step, ::t_step], 1)
+    f = f[::f_step]
+    t = t[::t_step]
+
     fig = go.Figure(
         data=go.Heatmap(
             z=Sxx_db, x=t, y=f,
@@ -241,9 +258,10 @@ def build_layout():
             ),
 
             dcc.Interval(id="status-tick", interval=500, n_intervals=0),
-            # Spectrograms recompute on a slower tick than the status line
-            # because the FFT + plotly redraw is more expensive.
-            dcc.Interval(id="spec-tick", interval=1000, n_intervals=0),
+            # Spectrograms recompute on a slower tick than the status line: even
+            # downsampled, the FFT + Plotly redraw is the heaviest GUI work, so
+            # running it less often keeps the controls responsive.
+            dcc.Interval(id="spec-tick", interval=2000, n_intervals=0),
         ],
     )
 
