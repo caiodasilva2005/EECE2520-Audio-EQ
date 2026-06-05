@@ -186,6 +186,14 @@ class PlaybackController:
             if self._processor is not None:
                 self._processor.setCutoffFrequency(self._cutoff)
 
+    def set_position(self, block_index):
+        # Safe to call mid-playback, paused, or idle: AudioProcessor.seek just
+        # records a pending block index that the audio loop honors on its next
+        # iteration (or on resume / first play).
+        with self._lock:
+            if self._processor is not None:
+                self._processor.seek(int(block_index))
+
     def set_order(self, n):
         # Changing order changes SOS shape and can race the audio thread's
         # sosfilt call. Only apply when nothing is actively playing; the UI
@@ -217,8 +225,22 @@ class PlaybackController:
         raw = lf + hf
         return raw, lf, hf, self._sample_rate
 
+    def sampling_frequency(self):
+        """Sample rate (Hz) of the currently loaded file, or None if nothing is
+        loaded. Set by load() from AudioProcessor.getSamplingFrequency()."""
+        with self._lock:
+            return self._sample_rate
+
     def status(self):
         with self._lock:
+            if self._processor is not None:
+                position = self._processor.getCurrentBlock()
+                total_blocks = self._processor.getTotalBlocks()
+                position_seconds = self._processor.getCurrentSeconds()
+                duration_seconds = self._processor.getDurationSeconds()
+            else:
+                position = total_blocks = 0
+                position_seconds = duration_seconds = 0.0
             return {
                 "state": self._state,
                 "file": self._current_file,
@@ -227,4 +249,8 @@ class PlaybackController:
                 "connected": self._connected,
                 "dry_run": self._dry_run,
                 "error": self._error,
+                "position": position,
+                "total_blocks": total_blocks,
+                "position_seconds": position_seconds,
+                "duration_seconds": duration_seconds,
             }

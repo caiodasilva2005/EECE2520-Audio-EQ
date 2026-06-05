@@ -1,4 +1,5 @@
 
+import math
 import time
 import threading
 import numpy as np
@@ -37,6 +38,17 @@ class AudioProcessor:
 
         self._sos = self._buildSos()
         self._zi = np.zeros((self._sos.shape[0], 2))
+
+        # Length / position bookkeeping for the seek slider. blockSize > 0.
+        self._totalFrames = self._soundFile.frames
+        self._totalBlocks = math.ceil(self._totalFrames / blockSize)
+        self._currentBlock = 0
+
+        # Seeking is request-only: another thread (the Dash callback) sets
+        # _pendingSeek; processAudio performs the actual SoundFile.seek so all
+        # file access stays on the audio thread. Mirrors the pause Event pattern.
+        self._seekLock = threading.Lock()
+        self._pendingSeek = None
 
         # Event is set when running, cleared when paused.
         self._pauseEvent = threading.Event()
@@ -80,6 +92,30 @@ class AudioProcessor:
     def isPaused(self):
         return not self._pauseEvent.is_set()
 
+    # Requests a jump to the given block index; safe to call from another
+    # thread. The seek is applied by processAudio on its next iteration (or on
+    # resume / first play). Index is clamped to the valid block range.
+    def seek(self, blockIndex):
+        target = max(0, min(int(blockIndex), max(self._totalBlocks - 1, 0)))
+        with self._seekLock:
+            self._pendingSeek = target
+
+    # total number of blocks in the file
+    def getTotalBlocks(self):
+        return self._totalBlocks
+
+    # index of the block currently being processed (plain read, atomic under GIL)
+    def getCurrentBlock(self):
+        return self._currentBlock
+
+    # total duration of the file in seconds
+    def getDurationSeconds(self):
+        return self._totalFrames / self._soundFile.samplerate
+
+    # playback position of the current block in seconds
+    def getCurrentSeconds(self):
+        return self._currentBlock * self._blockSize / self._soundFile.samplerate
+
     # gets the sampling frequency of the audio file
     def getSamplingFrequency(self):
         return self._soundFile.samplerate
@@ -88,27 +124,42 @@ class AudioProcessor:
     # Performs a given callback function on each channel after processing each block
     # Performs an additional callback function after processing all blocks if provided
     # param done_callback: an optional function that is called after processing all blocks of audio data
-    # NOTE: will block for the length of the given audio file
     def processAudio(self, done_callback=None):
         block_duration = self._blockSize / self._soundFile.samplerate
-        print(f"[audio] start: sr={self._soundFile.samplerate} Hz "
-              f"channels={self._soundFile.channels} blockSize={self._blockSize} "
-              f"block_duration={block_duration*1000:.2f}ms "
-              f"cutoff={self._cutoffFreq}Hz order={self._filterOrder} sections={self._sos.shape[0]}")
         behind_count = 0
+        i = 0
         start = time.monotonic()
-        for i, block in enumerate(self._soundFile.blocks(blocksize=self._blockSize, always_2d=True)):
+        # Manual read loop (rather than SoundFile.blocks) so we can change the
+        # read position mid-stream in response to a seek request.
+        while True:
           block_t0 = time.monotonic()
 
           # If paused, block here until resumed and shift the timing baseline
           # forward so the deadline loop doesn't race to "catch up" on resume.
           if self.isPaused():
               pause_started = time.monotonic()
-              print(f"[audio] block #{i}: paused")
               self._pauseEvent.wait()
               paused_for = time.monotonic() - pause_started
               start += paused_for
-              print(f"[audio] block #{i}: resumed after {paused_for*1000:.1f}ms")
+
+          # Apply a pending seek (requested by seek() from the Dash thread).
+          with self._seekLock:
+              target = self._pendingSeek
+              self._pendingSeek = None
+          if target is not None:
+              self._soundFile.seek(target * self._blockSize)
+              i = target
+              # The filter state can't carry across a discontinuity, and the
+              # deadline baseline must be reset so the scheduler doesn't try to
+              # "catch up" or stall after the jump (next deadline ~ now + 1 block).
+              self._zi = np.zeros((self._sos.shape[0], 2))
+              start = time.monotonic() - i * block_duration
+
+          block = self._soundFile.read(self._blockSize, always_2d=True)
+          if len(block) == 0:  # EOF
+              break
+
+          self._currentBlock = i
 
           # Downmix to mono before filtering.  The DAC's two channels carry
           # the low/high bands of one signal, so there is nowhere to send a
@@ -158,8 +209,10 @@ class AudioProcessor:
               behind_count += 1
               print(f"[audio] block #{i}: BEHIND by {-delay*1000:.2f}ms (total behind: {behind_count})")
 
+          i += 1
+
         total_ms = (time.monotonic() - start) * 1000.0
-        print(f"[audio] done: {i+1} blocks, {total_ms:.1f}ms elapsed, "
+        print(f"[audio] done: {i} blocks, {total_ms:.1f}ms elapsed, "
               f"{behind_count} blocks missed deadline")
 
         if done_callback is not None:
